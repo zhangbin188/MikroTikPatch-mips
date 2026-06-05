@@ -1,8 +1,6 @@
 name: Patch Mikrotik RouterOS
 
 on:
-  # push:
-  #   branches: [ "main" ]
   schedule:
     - cron: "0 0 * * *"
   workflow_dispatch:
@@ -16,50 +14,10 @@ permissions:
   contents: write
 
 jobs:
-  Create_SquashFS:
-    runs-on: ubuntu-latest
-    env:
-      TZ: 'Asia/Shanghai'
-    steps:
-      - name: Create squashfs for option npk        
-        run: |
-          cd $GITHUB_WORKSPACE
-          sudo wget -O bash -nv https://busybox.net/downloads/binaries/1.31.0-i686-uclibc/busybox_ASH
-          sudo wget -O busybox -nv https://busybox.net/downloads/binaries/1.31.0-i686-uclibc/busybox
-          sudo chmod +x busybox
-          sudo chmod +x bash
-          sudo mkdir -p ./option-root/bin/
-          sudo mv busybox ./option-root/bin/
-          sudo mv bash ./option-root/bin/
-          COMMANDS=$(./option-root/bin/busybox --list)
-          for cmd in $COMMANDS; do
-              sudo ln -sf /pckg/option/bin/busybox ./option-root/bin/$cmd
-          done
-          sudo mksquashfs option-root option.sfs -quiet -comp xz -no-xattrs -b 256k
-          sudo rm -rf option-root
-       
-      - name: Create squashfs for python3 npk        
-        run: |
-          sudo wget -O cpython-3.11.9.tar.gz -nv https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-x86_64-unknown-linux-musl-install_only.tar.gz
-          sudo tar -xf cpython-3.11.9.tar.gz
-          sudo rm -f cpython-3.11.9.tar.gz
-          sudo rm -rf ./python/include
-          sudo rm -rf ./python/share
-          sudo mksquashfs python python3.sfs -quiet -comp xz -no-xattrs -b 256k
-          sudo rm -rf python
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          retention-days: 1
-          name: squashfs
-          path: ./*.sfs
-
   Patch_Latest_RouterOS:
     runs-on: ubuntu-latest
-    needs: Create_SquashFS
     strategy:
-      fail-fast: false
+      fail-fast: false # 允许 stable 失败后继续运行 testing
       matrix:
         channel: [stable, testing]
     env:
@@ -68,29 +26,15 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-        
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11' 
+        python-version: '3.11'
 
     - name: Install Python dependencies
       run: |
         pip install cryptography pycrypto
-
-    - name: Download Artifact
-      uses: actions/download-artifact@v4
-      with:
-        name: squashfs
-
-    - name: Check required scripts
-      run: |
-        for f in patch.py npk.py keygen.zip linux; do
-          if [ ! -f "$f" ]; then
-            echo "Missing $f - please add to repository"
-            exit 1
-          fi
-        done
 
     - name: Export secret keys to environment
       run: |
@@ -101,7 +45,7 @@ jobs:
         echo "MIKRO_LICENSE_PUBLIC_KEY=${{ secrets.MIKRO_LICENSE_PUBLIC_KEY }}" >> $GITHUB_ENV
         echo "MIKRO_NPK_SIGN_PUBLIC_LKEY=${{ secrets.MIKRO_NPK_SIGN_PUBLIC_LKEY }}" >> $GITHUB_ENV
 
-    - name: Get latest routeros version  
+    - name: Get latest routeros version
       run: |
         if [ "${{ inputs.version }}" == "" ]; then
           URL="${{ env.LATEST_VERSION_URL }}${{ matrix.channel }}"
@@ -112,17 +56,33 @@ jobs:
         echo "Latest Version: $LATEST_VERSION"
         echo "LATEST_VERSION=$LATEST_VERSION" >> $GITHUB_ENV
 
-    - name: Get netinstall-${{ env.LATEST_VERSION }}.zip
+    # ---- 关键修改：直接从项目Releases下载预构建的补丁包 ----
+    - name: Download pre-built option and python3 packages
       run: |
-        sudo wget -nv -O netinstall-$LATEST_VERSION.zip https://download.mikrotik.com/routeros/$LATEST_VERSION/netinstall-$LATEST_VERSION.zip
-        sudo unzip netinstall-$LATEST_VERSION.zip
-        sudo rm netinstall-$LATEST_VERSION.zip
+        # 从 GitHub API 获取指定 tag (即 RouterOS 版本) 下的所有 assets
+        DOWNLOAD_URL=$(curl -s https://api.github.com/repos/elseif/MikroTikPatch/releases/tags/$LATEST_VERSION | \
+          jq -r '.assets[] | select(.name | test("(option|python3)-.*\\.npk$")) | .browser_download_url')
+        
+        # 根据文件名下载
+        echo "$DOWNLOAD_URL" | while read url; do
+          if echo "$url" | grep -q "option"; then
+            echo "Downloading option.npk from $url"
+            wget -nv -O option.npk "$url"
+          elif echo "$url" | grep -q "python3"; then
+            echo "Downloading python3.npk from $url"
+            wget -nv -O python3.npk "$url"
+          fi
+        done
+        
+        # 检查文件是否成功下载
+        if [ ! -f option.npk ] || [ ! -f python3.npk ]; then
+          echo "Failed to download required .npk files for version $LATEST_VERSION"
+          exit 1
+        fi
+        ls -la *.npk
+    # -----------------------------------------------------
 
-    - name: Patch netinstall.exe
-      run: |
-        sudo -E python3 patch.py netinstall netinstall.exe
-        sudo zip netinstall-$LATEST_VERSION.zip ./netinstall.exe
-
+    # ---- 原有的获取和修补 ISO 的步骤，保持不变 ----
     - name: Get mikrotik-${{ env.LATEST_VERSION }}.iso
       run: |
         sudo wget -nv -O mikrotik-$LATEST_VERSION.iso https://download.mikrotik.com/routeros/$LATEST_VERSION/mikrotik-$LATEST_VERSION.iso
@@ -130,7 +90,7 @@ jobs:
     - name: Patch mikrotik-${{ env.LATEST_VERSION }}.iso
       run: |
         sudo apt-get install -y genisoimage > /dev/null
-        sudo mkdir ./iso 
+        sudo mkdir ./iso
         sudo mount -o loop,ro mikrotik-$LATEST_VERSION.iso ./iso
         sudo mkdir ./new_iso
         sudo rsync -a ./iso/ ./new_iso/
@@ -145,24 +105,11 @@ jobs:
             sudo -E python3 npk.py sign $file $file
         done
         sudo cp routeros-$LATEST_VERSION.npk ./new_iso/
-        # ======================= 关键修复开始 =======================
-        # 创建临时目录
-        mkdir -p ./temp_option/option
-        mkdir -p ./temp_python3/python3
-        
-        # 将sfs文件放入对应的组件目录
-        cp ./option.sfs ./temp_option/option/
-        cp ./python3.sfs ./temp_python3/python3/
-        
-        # 执行创建NPK包的命令
-        sudo -E python3 npk.py create option-$LATEST_VERSION.npk ./temp_option -C option -desc="busybox and ash"
-        sudo cp option-$LATEST_VERSION.npk ./new_iso/
-        sudo -E python3 npk.py create python3-$LATEST_VERSION.npk ./temp_python3 -C python3 -desc="python 3.11.9"
-        sudo cp python3-$LATEST_VERSION.npk ./new_iso/
-        
-        # 清理临时目录
-        rm -rf ./temp_option ./temp_python3
-        # ======================= 关键修复结束 =======================
+
+        # --- 使用下载好的预构建包，不再手动创建 ---
+        sudo cp option.npk ./new_iso/
+        sudo cp python3.npk ./new_iso/
+
         sudo cp linux ./new_iso/isolinux/
         sudo mkdir ./efiboot
         sudo mount -o loop ./new_iso/efiboot.img ./efiboot
@@ -184,7 +131,9 @@ jobs:
                     -R -J \
                     ./new_iso
         sudo rm -rf ./new_iso
+    # -----------------------------------------------
 
+    # ... 其余处理 chr、install-image、mmips 以及创建 Release 的步骤保持不变 ...
     - name: Get chr-${{ env.LATEST_VERSION }}.img
       run: |
         sudo wget -nv -O chr-$LATEST_VERSION.img.zip https://download.mikrotik.com/routeros/$LATEST_VERSION/chr-$LATEST_VERSION.img.zip
@@ -204,7 +153,7 @@ jobs:
         sudo mkdir -p ./routeros/rw/disk
         sudo cp keygen.zip ./routeros/rw/disk
         sudo mkdir -p ./routeros/var/pdb/option
-        sudo cp option-$LATEST_VERSION.npk ./routeros/var/pdb/option/image
+        sudo cp option.npk ./routeros/var/pdb/option/image
         sudo cp routeros-$LATEST_VERSION.npk ./routeros/var/pdb/system/image
         sudo umount /dev/nbd0p2
         sudo rm -rf ./routeros
@@ -247,8 +196,8 @@ jobs:
         done
         sudo cp routeros-$LATEST_VERSION.npk ./install/1.npk
         sudo cp keygen.zip ./install/
-        sudo cp option-$LATEST_VERSION.npk ./install/100.npk
-        sudo cp python3-$LATEST_VERSION.npk ./install/101.npk
+        sudo cp option.npk ./install/100.npk
+        sudo cp python3.npk ./install/101.npk
         sudo cp linux ./install/
         sudo umount ./install
         sudo rm -rf ./install
