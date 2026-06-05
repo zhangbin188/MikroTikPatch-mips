@@ -1,6 +1,8 @@
 name: Patch Mikrotik RouterOS
 
 on:
+  # push:
+  #   branches: [ "main" ]
   schedule:
     - cron: "0 0 * * *"
   workflow_dispatch:
@@ -57,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: Create_SquashFS
     strategy:
-      fail-fast: false   # 允许 stable 失败后继续运行 testing
+      fail-fast: false
       matrix:
         channel: [stable, testing]
     env:
@@ -143,18 +145,30 @@ jobs:
             sudo -E python3 npk.py sign $file $file
         done
         sudo cp routeros-$LATEST_VERSION.npk ./new_iso/
-        # 修正：分别创建两个 npk，并复制到 new_iso
-        sudo -E python3 npk.py create option-$LATEST_VERSION.npk ./option.sfs -C option -desc="busybox and ash"
+        # ======================= 关键修复开始 =======================
+        # 创建临时目录
+        mkdir -p ./temp_option/option
+        mkdir -p ./temp_python3/python3
+        
+        # 将sfs文件放入对应的组件目录
+        cp ./option.sfs ./temp_option/option/
+        cp ./python3.sfs ./temp_python3/python3/
+        
+        # 执行创建NPK包的命令
+        sudo -E python3 npk.py create option-$LATEST_VERSION.npk ./temp_option -C option -desc="busybox and ash"
         sudo cp option-$LATEST_VERSION.npk ./new_iso/
-        sudo -E python3 npk.py create python3-$LATEST_VERSION.npk ./python3.sfs -C python3 -desc="python 3.11.9"
+        sudo -E python3 npk.py create python3-$LATEST_VERSION.npk ./temp_python3 -C python3 -desc="python 3.11.9"
         sudo cp python3-$LATEST_VERSION.npk ./new_iso/
+        
+        # 清理临时目录
+        rm -rf ./temp_option ./temp_python3
+        # ======================= 关键修复结束 =======================
         sudo cp linux ./new_iso/isolinux/
         sudo mkdir ./efiboot
         sudo mount -o loop ./new_iso/efiboot.img ./efiboot
         sudo cp linux ./efiboot/linux.x86_64
         sudo umount ./efiboot
         sudo rm -rf ./efiboot
-        # 替换 mkisofs 为 genisoimage
         sudo genisoimage -o mikrotik-$LATEST_VERSION.iso \
                     -V "MikroTik $LATEST_VERSION Patched" \
                     -sysid "" -preparer "MiKroTiK" \
